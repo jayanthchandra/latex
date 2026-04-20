@@ -1,0 +1,378 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{natbib}
+\usepackage{microtype}
+\usepackage{enumitem}
+
+% Image path
+\graphicspath{{images/}}
+
+% Hyperlink styling
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!70!black
+}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    captionpos=b,
+    language=Python
+}
+
+% Custom commands
+\newcommand{\Qref}{Q_{\text{ref}}}
+\newcommand{\Kbin}{K_{\text{bin}}}
+\newcommand{\Vbin}{V_{\text{bin}}}
+
+\title{
+    \vspace{-1cm}
+    \LARGE \textbf{Entropy-Guided KV Cache Summarization via} \\[4pt]
+    \LARGE \textbf{Low-Rank Attention Reconstruction}
+    \vspace{0.3cm}
+}
+
+\author{
+    Jayanth Chandra \\
+    \small \href{https://jchandra.com}{jchandra.com}
+}
+
+\date{2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+As Large Language Models move toward million-token context windows, the KV cache has emerged as a primary bottleneck, with memory scaling linearly in sequence length. Existing pruning strategies --- such as Heavy Hitter and Top-K eviction --- operate under the premise that tokens with low current attention scores are expendable. We demonstrate that this assumption leads to selective and unpredictable failures, particularly for structurally important tokens whose contributions are not locally dominant. We propose the \textbf{SRC (Selection-Reconstruction-Compression)} pipeline, a mathematically principled alternative that summarizes rather than discards tokens. Specifically, we identify high-entropy, low-salience tokens via Shannon attention entropy, reconstruct their aggregate functional contribution using Ordinary Least Squares (OLS) against reference queries, and compress the resulting weight matrix via truncated Singular Value Decomposition (SVD). Experiments on a synthetic Transformer demonstrate that our method, \textbf{HAE (Hierarchical Attention Entropy)}, achieves up to $3\times$ lower reconstruction error than Top-K at a 30\% keep ratio, while simultaneously using \emph{less} memory --- challenging the assumption that fewer tokens implies better efficiency.
+\end{abstract}
+
+\vspace{0.5em}
+\noindent\textbf{Keywords:} KV cache compression, attention entropy, low-rank approximation, OLS reconstruction, long-context inference
+
+\hrule
+\vspace{1em}
+
+%% ============================================================
+\section{Introduction}
+%% ============================================================
+
+The standard Transformer architecture requires each new token to attend over the keys and values of all preceding tokens. The resulting KV cache grows as $\mathcal{O}(N)$ in sequence length $N$, quickly saturating the VRAM budget of a single GPU for long-context settings. This motivates a class of methods that selectively \emph{evict} tokens from the cache.
+
+Dominant approaches --- Heavy Hitter Oracle~\citep{zhang2023h2o} and Top-K eviction --- operate on a common intuition: tokens with low attention scores at step $t$ are unlikely to be attended to at step $t+1$. While appealing in its simplicity, this heuristic suffers from a structural flaw: attention is a \emph{global}, context-dependent mechanism. A token that is diffuse and unremarkable at one timestep may become the primary semantic anchor several tokens later, particularly in tasks involving coreference, multi-hop reasoning, or delayed retrieval.
+
+We demonstrate this empirically: per-token reconstruction error under Top-K is not uniform but exhibits \textbf{sharp, unpredictable spikes} at structurally important positions. These failures cannot be anticipated from local importance scores alone.
+
+To address this, we shift the paradigm from \emph{eviction} to \emph{summarization}. Instead of asking ``is this token important?'', we ask ``what does this token contribute, and can we preserve that contribution compactly?'' This reframing leads to the SRC pipeline: a three-stage method combining information-theoretic selection, algebraic reconstruction, and low-rank compression.
+
+%% ============================================================
+\section{Background and Motivation}
+%% ============================================================
+
+\subsection{Attention Mechanism}
+
+For a query matrix $Q \in \mathbb{R}^{T \times d}$, key matrix $K \in \mathbb{R}^{N \times d}$, and value matrix $V \in \mathbb{R}^{N \times d}$, the scaled dot-product attention output is:
+\[
+    \text{Attn}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right) V
+\]
+Each row of the attention matrix represents a probability distribution over all key positions. The KV cache stores $(K, V)$ for all past tokens, enabling autoregressive generation.
+
+\subsection{Why Top-K Pruning Fails}
+
+Empirically, attention patterns in trained Transformers are \textbf{highly structured and non-sparse}: multiple tokens contribute jointly to a single attention output, and these contributions are distributed across the full sequence. Figure~\ref{fig:heatmap} illustrates this structure.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.62\linewidth]{b4_heatmap.png}
+    \caption{Full attention heatmap across a 200-token sequence. Each row is a query token; each column is a key token; intensity reflects attention weight. The pattern is globally dense --- dependencies are distributed across the entire sequence, not concentrated in a few positions.}
+    \label{fig:heatmap}
+\end{figure}
+
+Pruning removes tokens whose attention scores fall below a threshold. While this preserves the most salient tokens on average, it introduces catastrophic failures at specific positions. Figure~\ref{fig:topk_error} shows this failure mode directly.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.72\linewidth]{b4_topk.png}
+    \caption{Per-token reconstruction error (MSE) under Top-K pruning. Most tokens exhibit near-zero error, but a sharp spike near token index 110 reveals a structurally important token whose contribution Top-K fails to preserve. Such failures are unpredictable from local attention scores alone.}
+    \label{fig:topk_error}
+\end{figure}
+
+%% ============================================================
+\section{The SRC Pipeline}
+%% ============================================================
+
+The SRC pipeline consists of three stages applied to a designated \emph{Recycle Bin} --- a buffer of tokens selected for summarization.
+
+\[
+    \underbrace{\text{Selection}}_{\text{Entropy}} \;\rightarrow\; \underbrace{\text{Reconstruction}}_{\text{OLS}} \;\rightarrow\; \underbrace{\text{Compression}}_{\text{SVD}}
+\]
+
+\subsection{Stage 1: Selection via Composite Salience Score}
+
+Rather than evicting by raw attention magnitude alone, we use a \textbf{composite salience score} that jointly considers attention importance and information uncertainty. For each cached token $t$ with attention score $s_t$ and Shannon entropy:
+\[
+    H(\mathbf{p}_t) = -\sum_{i} p_{t,i} \log p_{t,i}
+\]
+we define its eviction priority as:
+\[
+    \phi_t = s_t - \alpha \cdot H(\mathbf{p}_t), \qquad \alpha = 0.5
+\]
+
+A token with low attention score \emph{and} high entropy receives the smallest $\phi_t$ and is evicted first. This penalises tokens that are both inattended-to and informationally diffuse --- the least structurally load-bearing entries in the cache. Figure~\ref{fig:entropy} shows the entropy landscape that informs this score.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.72\linewidth]{b4_entropy.png}
+    \caption{Shannon entropy per token across a 200-token sequence. Most tokens sit near zero (sharp, focused attention); a sparse subset exhibit high entropy peaks corresponding to diffuse attention. Tokens with low $\phi_t = s_t - 0.5 \cdot H(\mathbf{p}_t)$ are preferentially routed to the Recycle Bin.}
+    \label{fig:entropy}
+\end{figure}
+
+All incoming tokens are first added to the Active Cache. When the cache exceeds budget $k_{\text{budget}}$, the token with the lowest $\phi_t$ is evicted into the Recycle Bin. This makes selection \textbf{reactive} (budget-triggered) rather than proactive, ensuring the Active Cache always operates at full capacity. When the Recycle Bin accumulates $B$ tokens, Stages 2 and 3 are triggered.
+
+\subsection{Stage 2: OLS Reconstruction}
+
+Simply averaging the binned tokens ignores the specific queries that will interact with the summarized representation. Instead, we pose summarization as an Ordinary Least Squares problem.
+
+The current query matrix $Q \in \mathbb{R}^{r \times d}$ serves as the reference. Given the binned keys $K_{\mathcal{R}}$ and values $V_{\mathcal{R}}$, we first compute the attention output over the Recycle Bin:
+\[
+    \hat{A} = \text{softmax}(Q K_{\mathcal{R}}^\top)\, V_{\mathcal{R}}
+\]
+We then seek a weight matrix $W \in \mathbb{R}^{d \times d}$ such that $QW \approx \hat{A}$, minimising:
+\[
+    W^* = \arg\min_{W} \left\| Q W - \hat{A} \right\|_2^2
+\]
+Solved analytically via the Moore-Penrose pseudoinverse:
+\[
+    W^* = Q^{\dagger} \cdot \hat{A}
+\]
+
+\begin{lstlisting}[caption={OLS reconstruction inside \texttt{summarize\_bin} (PyTorch).}, label={lst:ols}]
+scores = Q @ keys.T
+weights = F.softmax(scores, dim=-1)
+output_bin = weights @ vals      # A_hat
+Q_pinv = torch.linalg.pinv(Q)
+W = Q_pinv @ output_bin          # W*
+\end{lstlisting}
+
+\subsection{Stage 3: Low-Rank Compression via SVD}
+
+The weight matrix $W^* \in \mathbb{R}^{d \times d}$ is itself memory-intensive. To achieve actual VRAM savings, we apply a full SVD and retain only the top-$k$ components:
+\[
+    W^* = U \Sigma V^\top, \qquad W^* \approx \sum_{i=1}^{k} \sigma_i \, \mathbf{u}_i \mathbf{v}_i^\top
+\]
+
+Each rank-1 component is decomposed into a synthetic key-value pair by distributing the singular value symmetrically:
+\[
+    \tilde{k}_i = \mathbf{u}_i \cdot \sqrt{\sigma_i}, \qquad \tilde{v}_i = \mathbf{v}_i \cdot \sqrt{\sigma_i}
+\]
+
+so that $\tilde{k}_i \tilde{v}_i^\top = \mathbf{u}_i \sigma_i \mathbf{v}_i^\top$. This produces $k$ \textbf{centroid tokens} $(\tilde{k}_i, \tilde{v}_i)$ that compactly represent the entire Recycle Bin. Each centroid is reinserted into the Active Cache with a neutral salience score of $\phi = 0.5$ (mid-priority), preventing immediate re-eviction.
+
+\begin{lstlisting}[caption={SVD compression and centroid construction (PyTorch).}, label={lst:svd}]
+U, S, Vh = torch.linalg.svd(W)
+S = torch.clamp(S, min=1e-6)
+for i in range(self.k_rank):
+    k_c = U[:, i] * torch.sqrt(S[i])
+    v_c = Vh[i, :] * torch.sqrt(S[i])
+    self.active_cache.append((k_c, v_c, 0.5, 0.5))
+\end{lstlisting}
+
+%% ============================================================
+\section{Evaluation Protocol}
+%% ============================================================
+
+\subsection{FAIR: Equal Effective Capacity}
+
+Inserting $k$ centroid tokens while removing $B$ Recycle Bin tokens changes the net cache size. To ensure fair comparison, the implementation enforces a target size immediately after each compression cycle:
+\[
+    \text{target} = k_{\text{budget}} - (B - k_{\text{rank}})
+\]
+Any tokens exceeding this target are evicted by composite score before the next step. This constraint is applied \emph{live} during inference, not only at evaluation time, keeping all methods under the same effective KV budget throughout the sequence.
+
+\subsection{REAL: Actual Memory Footprint}
+
+We also measure true memory consumption without any adjustment, reflecting real deployment conditions:
+\[
+    \text{memory}(K, V) = \frac{(\text{numel}(K) + \text{numel}(V)) \times 4}{1024^2} \text{ MB}
+\]
+
+%% ============================================================
+\section{Results}
+%% ============================================================
+
+\subsection{Memory Evolution}
+
+Figure~\ref{fig:memory} illustrates the KV cache size over time under Top-K and HAE.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.78\linewidth]{b4_memory.png}
+    \caption{KV cache size (token count) vs.\ sequence position. Top-K (blue) enforces a strict flat cap through continuous eviction. HAE (orange) exhibits a sawtooth pattern: the cache grows between compression events and drops sharply each time the Recycle Bin fills and the SRC cycle fires.}
+    \label{fig:memory}
+\end{figure}
+
+\subsection{KV Compression Strategies (FAIR Setting)}
+
+Figure~\ref{fig:compression} compares five methods across keep ratios from 10\% to 50\% under the FAIR setting.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.78\linewidth]{b4_compression.png}
+    \caption{Reconstruction MSE vs.\ keep ratio (FAIR setting). HAE (Entropy + OLS) dominates across all budgets. OLS (rank-$k$) without entropy selection stays flat and fails to adapt. Sliding Window performs worst due to its purely recency-based retention. Top-K degrades rapidly below a 20\% keep ratio.}
+    \label{fig:compression}
+\end{figure}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Method} & \textbf{Description} \\
+\midrule
+Top-K & Retain tokens with highest attention importance \\
+Sliding Window & Retain only the most recent tokens \\
+OLS (rank-$k$) & Low-rank approximation without entropy selection \\
+HAE Vanilla & Entropy-based selection without OLS reconstruction \\
+HAE (Entropy + OLS) & Full SRC pipeline \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Full SRC pipeline dominates.} HAE (Entropy + OLS) achieves the lowest MSE across all keep ratios.
+
+\paragraph{Selection alone is insufficient.} Entropy-based selection (HAE Vanilla) improves over naive methods, but OLS reconstruction is critical --- without it, performance degrades substantially at lower budgets.
+
+\paragraph{Compression without selection fails.} OLS (rank-$k$) without selection remains flat, highlighting that functional approximation must be guided by token importance.
+
+\paragraph{Top-K is strong but fragile.} Top-K performs reasonably at high budgets but degrades rapidly at low ratios due to the positional failure modes in Section~2.
+
+\subsection{FAIR vs.\ REAL: Accuracy and Memory Tradeoff}
+
+Figure~\ref{fig:accuracy} evaluates the full pipeline across both regimes.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{b4_accuracy.png}
+    \caption{\textbf{Left (FAIR):} Reconstruction MSE under equal effective budget. HAE consistently outperforms Top-K, with the largest gap at low keep ratios. \textbf{Right (REAL):} Actual memory footprint (MB). HAE uses strictly less memory than Top-K at every keep ratio, as low-rank centroids carry higher information density per stored byte than raw tokens.}
+    \label{fig:accuracy}
+\end{figure}
+
+At a 30\% keep ratio, HAE achieves approximately $3\times$ lower reconstruction error than Top-K in the FAIR setting, while simultaneously consuming less VRAM in the REAL setting. This challenges the common assumption that fewer stored tokens implies better efficiency --- memory is better evaluated in terms of \textbf{information density} than raw token count.
+
+%% ============================================================
+\section{Discussion}
+%% ============================================================
+
+\subsection{Computational Overhead}
+
+The primary cost is the OLS pseudoinverse and SVD, both amortized over the Recycle Bin fill cycle. At very long sequence lengths, cumulative overhead may dominate. Two directions for mitigation: (1) \textbf{incremental low-rank updates} that maintain the factorization without full recomputation; (2) \textbf{approximate solvers} such as randomized SVD or Nystr\"{o}m approximation. Without such improvements, simple pruning will win on latency at extreme context lengths.
+
+\subsection{Task Sensitivity}
+
+HAE is expected to be most robust for tasks with distributed attention patterns (summarization, general language modeling), where aggregate contribution matters more than individual token fidelity. Tasks requiring sharp, precise retrieval (passkey lookup, exact copying) may degrade faster under summarization. Benchmarking across long-context reasoning and retrieval setups (e.g., SCROLLS, RULER) is a key next step.
+
+\subsection{Relation to Prior Work}
+
+Low-rank attention approximations~\citep{wang2020linformer, chen2021scatterbrain} reduce attention dimensionality at training time rather than as dynamic cache management. Memorizing Transformers~\citep{wu2022memorizing} use external memory, whereas HAE compresses within the existing KV structure. Scissorhands~\citep{liu2023scissorhands} exploits persistence of importance --- a property our entropy criterion explicitly targets for \emph{inversion}, routing non-persistent tokens to the Recycle Bin rather than evicting them outright.
+
+%% ============================================================
+\section{Conclusion}
+%% ============================================================
+
+We presented HAE, an entropy-guided KV cache summarization method based on the SRC pipeline. By reframing cache management as a reconstruction problem, HAE preserves the functional contribution of discarded tokens through query-aware OLS reconstruction and low-rank SVD compression.
+
+Our results show that HAE: (1) significantly outperforms pruning-based methods on reconstruction fidelity at tight memory budgets; (2) uses less actual memory than Top-K by exploiting information density; and (3) exposes a principled accuracy-compute tradeoff motivating efficient approximate SRC implementations via Triton kernels and streaming low-rank updates.
+
+\vspace{0.5em}
+\noindent The full research notebook is available at: \url{https://github.com/jayanthchandra/notebooks/blob/main/HAE_OLS.ipynb}
+
+\section*{Acknowledgements}
+
+Experiments were conducted on free GPU credits. The author thanks the open-source ML community for discussions on KV cache compression.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Zhang et~al.(2023)]{zhang2023h2o}
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai, R., Song, Z., Tian, Y., R{\'e}, C., Barrett, C., et~al. (2023).
+\newblock H$_2$O: Heavy-hitter oracle for efficient generative inference of large language models.
+\newblock \emph{Advances in Neural Information Processing Systems}, 36.
+
+\bibitem[Wang et~al.(2020)]{wang2020linformer}
+Wang, S., Li, B., Khabsa, M., Fang, H., \& Ma, H. (2020).
+\newblock Linformer: Self-attention with linear complexity.
+\newblock \emph{arXiv preprint arXiv:2006.04768}.
+
+\bibitem[Chen et~al.(2021)]{chen2021scatterbrain}
+Chen, B., Dao, T., Winsor, E., Song, Z., Rudra, A., \& R{\'e}, C. (2021).
+\newblock Scatterbrain: Unifying sparse and low-rank attention.
+\newblock \emph{Advances in Neural Information Processing Systems}, 34.
+
+\bibitem[Wu et~al.(2022)]{wu2022memorizing}
+Wu, Y., Rabe, M., Hutchins, D., \& Szegedy, C. (2022).
+\newblock Memorizing transformers.
+\newblock \emph{International Conference on Learning Representations}.
+
+\bibitem[Liu et~al.(2023)]{liu2023scissorhands}
+Liu, Z., Desai, A., Liao, F., Wang, W., Xie, V., Xu, Z., Kyrillidis, A., \& Shrivastava, A. (2023).
+\newblock Scissorhands: Exploiting the persistence of importance hypothesis for LLM KV cache compression at test time.
+\newblock \emph{Advances in Neural Information Processing Systems}, 36.
+
+\end{thebibliography}
+
+\appendix
+\section{Algorithm Summary}
+
+\begin{algorithm}[H]
+\caption{HAE SRC Compression Cycle (\texttt{HAECacheManager})}
+\begin{algorithmic}[1]
+\Require Budget $k_{\text{budget}}$, bin capacity $B$, rank $k$, $\alpha = 0.5$
+\Require Active Cache $\mathcal{A} \leftarrow [\,]$, Recycle Bin $\mathcal{R} \leftarrow [\,]$
+\vspace{0.3em}
+\Procedure{Push}{$K_t, V_t, s_t, H_t, Q$} \Comment{$s_t$: attn score, $H_t$: entropy}
+    \State $\mathcal{A} \leftarrow \mathcal{A} \cup \{(K_t, V_t, s_t, H_t)\}$
+    \If{$|\mathcal{A}| > k_{\text{budget}}$}
+        \State $t^* \leftarrow \arg\min_{t \in \mathcal{A}}\; s_t - \alpha \cdot H_t$ \Comment{lowest composite score}
+        \State Move $t^*$ from $\mathcal{A}$ to $\mathcal{R}$
+    \EndIf
+    \If{$|\mathcal{R}| \geq B$}
+        \State \Call{SummarizeBin}{$Q$}
+    \EndIf
+\EndProcedure
+\vspace{0.3em}
+\Procedure{SummarizeBin}{$Q$}
+    \State $\hat{A} \leftarrow \text{softmax}(Q K_{\mathcal{R}}^\top)\, V_{\mathcal{R}}$ \Comment{attention over Recycle Bin}
+    \State $W^* \leftarrow Q^{\dagger}\, \hat{A}$ \Comment{OLS: pseudoinverse solve}
+    \State $U, \Sigma, V^\top \leftarrow \text{SVD}(W^*)$;\quad $\Sigma \leftarrow \max(\Sigma,\, 10^{-6})$
+    \For{$i = 1, \ldots, k$}
+        \State $\tilde{k}_i \leftarrow U_{:,i} \cdot \sqrt{\sigma_i}$;\quad $\tilde{v}_i \leftarrow V_{i,:} \cdot \sqrt{\sigma_i}$
+        \State $\mathcal{A} \leftarrow \mathcal{A} \cup \{(\tilde{k}_i,\, \tilde{v}_i,\; 0.5,\; 0.5)\}$ \Comment{neutral salience}
+    \EndFor
+    \State $\mathcal{R} \leftarrow [\,]$
+    \State $\text{target} \leftarrow k_{\text{budget}} - (B - k)$ \Comment{enforce FAIR budget}
+    \While{$|\mathcal{A}| > \text{target}$}
+        \State Evict $\arg\min_{t \in \mathcal{A}}\; s_t - \alpha \cdot H_t$ from $\mathcal{A}$
+    \EndWhile
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
